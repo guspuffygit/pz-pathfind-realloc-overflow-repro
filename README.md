@@ -42,56 +42,6 @@ memcpy(p, old, n < size ? n : size);
 
 Passing the old element count from the caller would be cleaner than asking the allocator. The Windows build was not checked.
 
-## Reproduction
-
-The first row of the table above depends on heap fragmentation that a production server reaches after hours. `libpfprobe.so` forces that row. It is an `LD_PRELOAD` library that gives every Nth 4-byte request from the pathfinder a 0x30 chunk, which is a block glibc itself may legally return. Everything after that is the game's own code.
-
-The probe also interposes `reallocate_aligned`, which the pathfinder calls through its PLT. It calls the library's own function and checks whether bytes landed past the new block.
-
-1. Build the probe.
-
-   ```
-   make
-   ```
-
-2. Start the dedicated server with it.
-
-   ```
-   LD_PRELOAD=$PWD/libpfprobe.so PF_LOG=/tmp/pfprobe.log PF_MODE=verify PF_INJECT=200 ./start-server.sh
-   ```
-
-3. Make something path across 5 or more floors. Zombies chasing a player up a tall building does it. `storm-driver/EvalScript.java` generates such requests on an empty server, but it needs the Storm mod loader.
-
-4. Watch `/tmp/pfprobe.log`.
-
-| Variable | Meaning |
-| --- | --- |
-| `PF_LOG` | Log file. |
-| `PF_MODE=verify` | Call the library's own function and log `OVERFLOW WRITTEN` when bytes land past the new block. |
-| `PF_INJECT=N` | Give every Nth 4-byte request from the pathfinder a 0x30 chunk. |
-
-The function offset `0x5aff0` in `probe.c` matches the 42.22.2 build.
-
-## Expected result
-
-Measured on 42.22.2 under glibc 2.39, with path requests between floors of the downtown Louisville towers.
-
-| Library | Result |
-| --- | --- |
-| Shipped | `OVERFLOW WRITTEN` on the first forced case. The server died seconds later with SIGSEGV in `SearchNode::init` on `PathfindNativeThread`. |
-| Same library with the copy clamped to `size` | 38 forced cases, 0 overflows, 8,712 paths found, no crash in 5 minutes. |
-
-Log from the shipped library:
-
-```
-[pfprobe] first call from .../linux64/libPZPathFind64.so, bytes at +0x5afff: 48 89 d7 e8 (ORIGINAL)
-[pfprobe] OVERFLOW WRITTEN #1: size=8 align=1 usable(old)=40 usable(new)=0 -> 40 bytes past the block
-#  SIGSEGV (0xb) at pc=0x00007e51762cfd67
-# C  [libPZPathFind64.so+0x55d67]  SearchNode::init(VGAStar*, Square*)+0x17
-```
-
-`usable(new)=0` is glibc reporting that the chunk after the new block lost its in-use bit.
-
 ## Backtrace from production
 
 ```
@@ -111,3 +61,69 @@ Java_zombie_pathfind_nativeCode_PathfindNative_findPath
 ```
 
 The abort happens at a later allocation, so the faulting frame is rarely `reallocate_aligned` itself.
+
+## Reproduction 1, standalone
+
+This needs gcc, make and the shipped library. It takes a second.
+
+```
+make
+./repro "/path/to/Project Zomboid Dedicated Server/linux64/libPZPathFind64.so"
+```
+
+`repro.c` loads the library, steers glibc into handing a 4-byte request a 0x30 chunk using ordinary malloc and free calls, and then calls the library's own `reallocate_aligned(old, 8, 1)`.
+
+Expected output with the shipped library:
+
+```
+step 1: aligned_alloc(1, 4) returned a block with 40 usable bytes (glibc gave out a whole 0x30 chunk)
+step 2: reallocate_aligned(old, 8, 1) returned a block with 24 usable bytes
+
+OVERFLOW: memcpy copied 40 bytes into a 24-byte block.
+16 bytes of the old block landed on the next chunk. Its size field now reads 0xa5a5a5a5a5a5a5a5.
+
+step 3: the owner of the damaged chunk frees it
+Segmentation fault
+```
+
+`make run-patched LIB=<path>` builds a fixed copy of the library with `patch.py` and runs the same test. It prints `OK: nothing was written past the new block` and exits 0.
+
+Verified on glibc 2.39 (Ubuntu 24.04) and glibc 2.43.
+
+## Reproduction 2, on a running dedicated server
+
+`libpfprobe.so` is an `LD_PRELOAD` library that interposes `reallocate_aligned`. The pathfinder calls the function through its PLT, so the preload sees every call.
+
+```
+make
+LD_PRELOAD=$PWD/libpfprobe.so PF_LOG=/tmp/pfprobe.log PF_MODE=verify PF_INJECT=200 ./start-server.sh
+```
+
+| Variable | Meaning |
+| --- | --- |
+| `PF_LOG` | Log file. |
+| `PF_MODE=count` | Default. The probe does a safe copy itself and logs `would overflow` for each call where the old chunk is larger than the new one. Safe on a production server. |
+| `PF_MODE=verify` | The probe calls the library's own function and logs `OVERFLOW WRITTEN` when bytes land past the new block. |
+| `PF_INJECT=N` | Every Nth 4-byte request from the pathfinder gets a 0x30 chunk. This forces the allocator state from the table above, which otherwise depends on hours of heap fragmentation. |
+
+Then make something path across 5 or more floors. Zombies chasing a player up a tall building does it.
+
+Results on 42.22.2 under glibc 2.39, with path requests between floors of the downtown Louisville towers:
+
+| Library | Result |
+| --- | --- |
+| Shipped | `OVERFLOW WRITTEN` on the first injected case. The server died seconds later with SIGSEGV in `SearchNode::init` on `PathfindNativeThread`. |
+| Patched with `patch.py` | 38 injected cases, 0 overflows, 8,712 paths found, no crash in 5 minutes. |
+
+Without injection the probe saw 3 million reallocations in 15 minutes and no natural hit, so the natural trigger is rare on a fresh heap.
+
+`storm-driver/EvalScript.java` is the request generator used for those runs. It needs the Storm mod loader and is included for reference.
+
+## Files
+
+| File | Purpose |
+| --- | --- |
+| `repro.c` | Standalone reproduction. |
+| `probe.c` | `LD_PRELOAD` probe for a live server. The function offset `0x5aff0` matches the 42.22.2 build. |
+| `patch.py` | Rewrites the function in a copy of the library so it copies `min(usable(old), size)`. 94 bytes change, all inside `0x5aff0..0x5b060`. |
+| `storm-driver/EvalScript.java` | Path request generator for a Storm server. |
