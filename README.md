@@ -127,3 +127,4 @@ Without injection the probe saw 3 million reallocations in 15 minutes and no nat
 | `probe.c` | `LD_PRELOAD` probe for a live server. The function offset `0x5aff0` matches the 42.22.2 build. |
 | `patch.py` | Rewrites the function in a copy of the library so it copies `min(usable(old), size)`. 94 bytes change, all inside `0x5aff0..0x5b060`. |
 | `storm-driver/EvalScript.java` | Path request generator for a Storm server. |
+| `prebuilt/libPZPathFind64-42.22.2-patched.so` | Output of `patch.py` on the 42.22.2 library. SHA-256 `cc7647334074bbaa1a501a47c4222b0392f784bee243ae132e87217306d6ab83`. Replace `linux64/libPZPathFind64.so` with it while the server is stopped. |
